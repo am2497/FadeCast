@@ -1,4 +1,10 @@
-"""Fadecast - version 5: shop info, logins with roles, owner settings, booking, cancel and move."""
+"""Fadecast - booking, live walk-in queue and demand forecasting for Clear Cuts.
+
+app.py      main page: logins, booking, cancel/move, shop settings, shop information
+live.py     live walk-in queue and the barber's day
+insights.py owner dashboard and Holt-Winters forecast
+logic.py    the maths (wait estimates, forecast accuracy), tested separately
+"""
 
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -6,6 +12,9 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 from supabase import create_client
+
+from insights import dashboard
+from live import public_queue, today_page
 
 st.set_page_config(page_title="Fadecast", page_icon="💈")
 
@@ -187,7 +196,7 @@ def all_bookings():
         "Until": datetime.fromisoformat(r["end_time"]).astimezone(LONDON).strftime("%H:%M"),
         "Customer": r["walk_in_name"] if r["is_walk_in"] else (r["profiles"] or {}).get("full_name"),
         "Service": r["services"]["name"],
-        "Barber": r["barbers"]["name"],
+        "Barber": (r["barbers"] or {}).get("name", "Any"),
         "Type": "Walk-in" if r["is_walk_in"] else "Booked online",
         "Status": r["status"].replace("_", " ").capitalize(),
     } for r in rows]), hide_index=True, use_container_width=True)
@@ -294,6 +303,22 @@ def owner_settings():
                     st.session_state.flash = f"Added {name.strip()}."
                     st.rerun()
 
+        with st.form("link_barber", clear_on_submit=True):
+            st.write("**Give a barber their own login**")
+            st.caption("They sign up on this website first, then you enter their email here. "
+                       "They will then see the Today page for their chair.")
+            c1, c2 = st.columns(2)
+            email = c1.text_input("Their email")
+            barber = c2.selectbox("They are", original.to_dict("records"), format_func=lambda b: b["name"])
+            if st.form_submit_button("Link login"):
+                try:
+                    db.rpc("make_barber", {"p_email": email, "p_barber": int(barber["id"])}).execute()
+                    st.session_state.flash = f"{email} is now linked to {barber['name']}."
+                except Exception as e:
+                    st.error(getattr(e, "message", None) or str(e))
+                else:
+                    st.rerun()
+
     # Opening hours
     with hours_tab:
         st.caption("Set the opening and closing time for each day, or tick 'Closed'.")
@@ -334,7 +359,10 @@ with st.sidebar:
         st.write(f"Signed in as **{profile.get('full_name') or user.email}**")
         st.caption(f"Role: {profile['role']}")
         if profile["role"] == "owner":
-            owner_page = st.radio("Go to", ["Bookings", "Shop settings", "Make a test booking"])
+            page = st.radio("Go to", ["Today", "Dashboard and forecast", "Bookings", "Shop settings",
+                                      "Make a test booking"])
+        elif profile["role"] == "barber":
+            page = st.radio("Go to", ["Today", "Bookings"])
         if st.button("Log out"):
             try:
                 db.auth.sign_out()
@@ -392,25 +420,34 @@ if "flash" in st.session_state:
 
 # What each role gets
 role = profile["role"] if user else None
-if role == "owner":
-    if owner_page == "Bookings":
+active_services = db.table("services").select("id, name, price, duration_minutes").eq("active", True) \
+    .order("price").execute().data
+
+if role in ("owner", "barber"):
+    if page == "Today":
+        today_page(db, LONDON, user.id)
+    elif page == "Dashboard and forecast":
+        dashboard(db, LONDON)
+    elif page == "Bookings":
         all_bookings()
-    elif owner_page == "Shop settings":
+    elif page == "Shop settings":
         owner_settings()
     else:
         booking_page()
         my_bookings()
+        public_queue(db, LONDON, user, active_services)
+    st.stop()  # staff pages end here; the shop information below is for customers
+
+if role == "customer":
+    public_queue(db, LONDON, user, active_services)
     st.divider()
-    st.caption("Below is what customers see.")
-elif role == "barber":
-    all_bookings()
-    st.divider()
-elif role == "customer":
     booking_page()
     my_bookings()
     st.divider()
 else:
-    st.info("Log in or sign up using the menu on the left to book a cut.")
+    public_queue(db, LONDON, None, active_services)
+    st.info("Log in or sign up using the menu on the left to book a cut or join the queue from your phone.")
+    st.divider()
 
 # Services and prices
 st.subheader("Services")
