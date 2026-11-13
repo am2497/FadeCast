@@ -1,4 +1,4 @@
-"""Fadecast - version 4: shop information, logins with roles, owner settings and online booking."""
+"""Fadecast - version 5: shop info, logins with roles, owner settings, booking, cancel and move."""
 
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -47,8 +47,9 @@ def when(timestamp):
     return datetime.fromisoformat(timestamp).astimezone(LONDON).strftime("%a %d %b, %H:%M")
 
 
-def free_slots(barber_id, day, minutes):
-    """List the start times on a day when this barber is free for the whole service (R02, R03)."""
+def free_slots(barber_id, day, minutes, ignore=None):
+    """List the start times on a day when this barber is free for the whole service (R02, R03).
+    'ignore' is a booking being moved, so its own current time does not count as busy."""
     h = db.table("opening_hours").select("*").eq("day_of_week", day.weekday()).execute().data[0]
     if h["closed"]:
         return []
@@ -57,6 +58,8 @@ def free_slots(barber_id, day, minutes):
     busy = db.rpc("busy_times", {"p_barber": barber_id, "p_from": opens.isoformat(),
                                  "p_to": closes.isoformat()}).execute().data
     busy = [(datetime.fromisoformat(b["start_time"]), datetime.fromisoformat(b["end_time"])) for b in busy]
+    if ignore:
+        busy = [b for b in busy if b != ignore]
     now = datetime.now(LONDON)
     slots, start = [], opens
     while start + timedelta(minutes=minutes) <= closes:
@@ -109,22 +112,64 @@ def booking_page():
                 st.error(f"Could not book: {e}")
 
 
+def db_message(error):
+    """Pull the plain message out of a database error."""
+    text = getattr(error, "message", None) or str(error)
+    if "no_double_booking" in text or "23P01" in text:
+        return "Sorry, that time has just been taken. Please pick another."
+    return text
+
+
 def my_bookings():
-    """The customer's own upcoming bookings."""
+    """R02: the customer's upcoming bookings, each one can be cancelled or moved."""
     st.subheader("My upcoming bookings")
-    rows = db.table("bookings").select("start_time, status, services(name, price), barbers(name)") \
-        .eq("customer_id", user.id).gte("start_time", datetime.now(LONDON).isoformat()) \
-        .order("start_time").execute().data
+    rows = db.table("bookings").select(
+        "id, start_time, end_time, status, barber_id, services(name, price, duration_minutes), barbers(name)") \
+        .eq("customer_id", user.id).eq("status", "booked") \
+        .gte("start_time", datetime.now(LONDON).isoformat()).order("start_time").execute().data
     if not rows:
         st.caption("You have no upcoming bookings.")
         return
-    st.dataframe(pd.DataFrame([{
-        "When": when(r["start_time"]),
-        "Service": r["services"]["name"],
-        "Barber": r["barbers"]["name"],
-        "Price": f"£{float(r['services']['price']):.2f}",
-        "Status": r["status"].replace("_", " ").capitalize(),
-    } for r in rows]), hide_index=True, use_container_width=True)
+    barbers = db.table("barbers").select("id, name").eq("active", True).order("id").execute().data
+
+    for r in rows:
+        title = f"{when(r['start_time'])} · {r['services']['name']} with {r['barbers']['name']}" \
+                f" · £{float(r['services']['price']):.2f}"
+        with st.expander(title):
+            if st.button("Cancel this booking", key=f"cancel_{r['id']}"):
+                try:
+                    db.rpc("cancel_booking", {"p_id": r["id"]}).execute()
+                    st.session_state.flash = "Your booking has been cancelled."
+                    st.rerun()
+                except Exception as e:
+                    st.error(db_message(e))
+
+            st.write("**Move to another time**")
+            current = datetime.fromisoformat(r["start_time"]).astimezone(LONDON)
+            c1, c2 = st.columns(2)
+            ids = [b["id"] for b in barbers]
+            barber = c1.selectbox("Barber", barbers, key=f"mb_{r['id']}", format_func=lambda b: b["name"],
+                                  index=ids.index(r["barber_id"]) if r["barber_id"] in ids else 0)
+            today = datetime.now(LONDON).date()
+            day = c2.date_input("Day", value=current.date(), min_value=today, max_value=today + timedelta(days=28),
+                                format="DD/MM/YYYY", key=f"md_{r['id']}")
+            ignore = (datetime.fromisoformat(r["start_time"]), datetime.fromisoformat(r["end_time"])) \
+                if barber["id"] == r["barber_id"] else None
+            slots = [s for s in free_slots(barber["id"], day, r["services"]["duration_minutes"], ignore)
+                     if not (s == current and barber["id"] == r["barber_id"])]
+            if not slots:
+                st.caption(f"{barber['name']} has no free times that day.")
+                continue
+            slot = st.selectbox("New time", slots, key=f"mt_{r['id']}", format_func=lambda t: t.strftime("%H:%M"))
+            if st.button("Move booking", key=f"move_{r['id']}", type="primary"):
+                try:
+                    db.rpc("move_booking", {"p_id": r["id"], "p_barber": barber["id"],
+                                            "p_start": slot.isoformat()}).execute()
+                    st.session_state.flash = (f"Moved to {slot.strftime('%A %d %B at %H:%M')} "
+                                              f"with {barber['name']}.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(db_message(e))
 
 
 def all_bookings():
