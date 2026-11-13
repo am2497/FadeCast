@@ -1,6 +1,7 @@
-"""Fadecast - version 3: shop information, logins with roles, and the owner's settings page."""
+"""Fadecast - version 4: shop information, logins with roles, owner settings and online booking."""
 
-from datetime import time
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -37,6 +38,114 @@ def load_profile(user_id):
 
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+LONDON = ZoneInfo("Europe/London")
+SLOT_STEP = 15  # booking times are offered every 15 minutes
+
+
+def when(timestamp):
+    """Show a database time as UK time, e.g. 'Sat 14 Nov, 10:30'."""
+    return datetime.fromisoformat(timestamp).astimezone(LONDON).strftime("%a %d %b, %H:%M")
+
+
+def free_slots(barber_id, day, minutes):
+    """List the start times on a day when this barber is free for the whole service (R02, R03)."""
+    h = db.table("opening_hours").select("*").eq("day_of_week", day.weekday()).execute().data[0]
+    if h["closed"]:
+        return []
+    opens = datetime.combine(day, time.fromisoformat(h["opens"]), LONDON)
+    closes = datetime.combine(day, time.fromisoformat(h["closes"]), LONDON)
+    busy = db.rpc("busy_times", {"p_barber": barber_id, "p_from": opens.isoformat(),
+                                 "p_to": closes.isoformat()}).execute().data
+    busy = [(datetime.fromisoformat(b["start_time"]), datetime.fromisoformat(b["end_time"])) for b in busy]
+    now = datetime.now(LONDON)
+    slots, start = [], opens
+    while start + timedelta(minutes=minutes) <= closes:
+        end = start + timedelta(minutes=minutes)
+        if start > now and all(not (start < b_end and end > b_start) for b_start, b_end in busy):
+            slots.append(start)
+        start += timedelta(minutes=SLOT_STEP)
+    return slots
+
+
+def booking_page():
+    """R01: a customer picks a service, a barber, a day and a free time."""
+    st.header("Book a cut")
+    services = db.table("services").select("id, name, price, duration_minutes").eq("active", True) \
+        .order("price").execute().data
+    barbers = db.table("barbers").select("id, name").eq("active", True).order("id").execute().data
+    if not services or not barbers:
+        st.info("Booking is not open yet.")
+        return
+
+    c1, c2 = st.columns(2)
+    service = c1.selectbox("Service", services, format_func=lambda s:
+                           f"{s['name']} – £{float(s['price']):.2f} ({s['duration_minutes']} min)")
+    barber = c2.selectbox("Barber", barbers, format_func=lambda b: b["name"])
+    today = datetime.now(LONDON).date()
+    day = st.date_input("Day", value=today, min_value=today, max_value=today + timedelta(days=28),
+                        format="DD/MM/YYYY")
+
+    slots = free_slots(barber["id"], day, service["duration_minutes"])
+    if not slots:
+        st.warning(f"{barber['name']} has no free times on {day.strftime('%A %d %B')}. Try another day or barber.")
+        return
+    slot = st.selectbox("Time", slots, format_func=lambda t: t.strftime("%H:%M"))
+
+    if st.button("Confirm booking", type="primary"):
+        try:
+            db.table("bookings").insert({
+                "customer_id": user.id,
+                "barber_id": barber["id"],
+                "service_id": service["id"],
+                "start_time": slot.isoformat(),
+            }).execute()
+            st.session_state.flash = (f"Booked: {service['name']} with {barber['name']} on "
+                                      f"{slot.strftime('%A %d %B at %H:%M')}.")
+            st.rerun()
+        except Exception as e:
+            if "no_double_booking" in str(e) or "23P01" in str(e):
+                st.error("Sorry, someone has just booked that time. Please pick another.")
+            else:
+                st.error(f"Could not book: {e}")
+
+
+def my_bookings():
+    """The customer's own upcoming bookings."""
+    st.subheader("My upcoming bookings")
+    rows = db.table("bookings").select("start_time, status, services(name, price), barbers(name)") \
+        .eq("customer_id", user.id).gte("start_time", datetime.now(LONDON).isoformat()) \
+        .order("start_time").execute().data
+    if not rows:
+        st.caption("You have no upcoming bookings.")
+        return
+    st.dataframe(pd.DataFrame([{
+        "When": when(r["start_time"]),
+        "Service": r["services"]["name"],
+        "Barber": r["barbers"]["name"],
+        "Price": f"£{float(r['services']['price']):.2f}",
+        "Status": r["status"].replace("_", " ").capitalize(),
+    } for r in rows]), hide_index=True, use_container_width=True)
+
+
+def all_bookings():
+    """Barbers and the owner see every booking from today onwards."""
+    st.header("Bookings")
+    start_of_today = datetime.combine(datetime.now(LONDON).date(), time(0), LONDON)
+    rows = db.table("bookings").select(
+        "start_time, end_time, status, is_walk_in, walk_in_name, services(name), barbers(name), profiles(full_name)") \
+        .gte("start_time", start_of_today.isoformat()).order("start_time").execute().data
+    if not rows:
+        st.caption("No bookings yet.")
+        return
+    st.dataframe(pd.DataFrame([{
+        "When": when(r["start_time"]),
+        "Until": datetime.fromisoformat(r["end_time"]).astimezone(LONDON).strftime("%H:%M"),
+        "Customer": r["walk_in_name"] if r["is_walk_in"] else (r["profiles"] or {}).get("full_name"),
+        "Service": r["services"]["name"],
+        "Barber": r["barbers"]["name"],
+        "Type": "Walk-in" if r["is_walk_in"] else "Booked online",
+        "Status": r["status"].replace("_", " ").capitalize(),
+    } for r in rows]), hide_index=True, use_container_width=True)
 
 
 def clean(value):
@@ -179,6 +288,8 @@ with st.sidebar:
     if user:
         st.write(f"Signed in as **{profile.get('full_name') or user.email}**")
         st.caption(f"Role: {profile['role']}")
+        if profile["role"] == "owner":
+            owner_page = st.radio("Go to", ["Bookings", "Shop settings", "Make a test booking"])
         if st.button("Log out"):
             try:
                 db.auth.sign_out()
@@ -237,13 +348,22 @@ if "flash" in st.session_state:
 # What each role gets
 role = profile["role"] if user else None
 if role == "owner":
-    owner_settings()
+    if owner_page == "Bookings":
+        all_bookings()
+    elif owner_page == "Shop settings":
+        owner_settings()
+    else:
+        booking_page()
+        my_bookings()
     st.divider()
     st.caption("Below is what customers see.")
 elif role == "barber":
-    st.info("Barber area: your bookings for the day and the walk-in queue will appear here.")
+    all_bookings()
+    st.divider()
 elif role == "customer":
-    st.info("Booking will appear here: pick a service, a barber and a time.")
+    booking_page()
+    my_bookings()
+    st.divider()
 else:
     st.info("Log in or sign up using the menu on the left to book a cut.")
 
