@@ -6,7 +6,11 @@ insights.py owner dashboard and Holt-Winters forecast
 logic.py    the maths (wait estimates, forecast accuracy), tested separately
 """
 
+import base64
+import hashlib
+import secrets as token_maker
 from datetime import datetime, time, timedelta
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -40,6 +44,50 @@ def friendly(error):
     return text
 
 
+@st.cache_resource
+def pending_google_logins():
+    """Google sign-in opens in a new browser tab, which is a new Streamlit session. This small store,
+    shared by the whole app, keeps each sign-in's secret check code until Google sends the person back."""
+    return {}
+
+
+def google_login_url():
+    """Build the 'Continue with Google' link (one-click sign-in, suggested by my supervisor).
+    Uses the PKCE method: a secret 'verifier' stays on our server and only its hash goes to Google."""
+    if "google_url" not in st.session_state:
+        store = pending_google_logins()
+        for key in [k for k, (_, made) in store.items() if datetime.now() - made > timedelta(minutes=10)]:
+            store.pop(key, None)  # forget sign-ins that were started but never finished
+        verifier = token_maker.token_urlsafe(64)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        ticket = token_maker.token_urlsafe(16)
+        store[ticket] = (verifier, datetime.now())
+        back_to = f"{st.secrets['APP_URL'].rstrip('/')}/?login={ticket}"
+        st.session_state.google_url = f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?" + urlencode({
+            "provider": "google", "redirect_to": back_to,
+            "code_challenge": challenge, "code_challenge_method": "s256"})
+    return st.session_state.google_url
+
+
+def finish_google_login():
+    """When Google sends someone back with ?login=...&code=..., swap the code for a Supabase login."""
+    ticket, code = st.query_params.get("login"), st.query_params.get("code")
+    if not (ticket and code):
+        return
+    st.query_params.clear()
+    entry = pending_google_logins().pop(ticket, None)
+    if not entry:
+        st.error("That Google sign-in link has expired. Please try again.")
+        return
+    try:
+        res = db.auth.exchange_code_for_session({"auth_code": code, "code_verifier": entry[0]})
+        st.session_state.user = res.user
+        st.session_state.profile = load_profile(res.user.id)
+        st.rerun()
+    except Exception as e:
+        st.error(f"Google sign-in did not work: {friendly(e)}")
+
+
 def load_profile(user_id):
     """Read the logged-in person's name and role (customer, barber or owner)."""
     rows = db.table("profiles").select("full_name, role").eq("id", user_id).execute().data
@@ -49,6 +97,7 @@ def load_profile(user_id):
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 LONDON = ZoneInfo("Europe/London")
 SLOT_STEP = 15  # booking times are offered every 15 minutes
+CHANGE_CUTOFF_HOURS = 2  # R02: customers can cancel or move until 2 hours before the start
 
 
 def when(timestamp):
@@ -140,11 +189,19 @@ def my_bookings():
         st.caption("You have no upcoming bookings.")
         return
     barbers = db.table("barbers").select("id, name").eq("active", True).order("id").execute().data
+    st.caption(f"You can cancel or move a booking online up to {CHANGE_CUTOFF_HOURS} hours before it starts.")
+    staff = profile["role"] in ("barber", "owner")
 
     for r in rows:
         title = f"{when(r['start_time'])} · {r['services']['name']} with {r['barbers']['name']}" \
                 f" · £{float(r['services']['price']):.2f}"
         with st.expander(title):
+            # R02: customers cannot change a booking in the last 2 hours (the database enforces this too)
+            starts = datetime.fromisoformat(r["start_time"])
+            if not staff and starts - datetime.now(LONDON) <= timedelta(hours=CHANGE_CUTOFF_HOURS):
+                st.info(f"This booking starts in less than {CHANGE_CUTOFF_HOURS} hours, so it can no longer "
+                        "be changed online. Please call the shop if you need to.")
+                continue
             if st.button("Cancel this booking", key=f"cancel_{r['id']}"):
                 try:
                     db.rpc("cancel_booking", {"p_id": r["id"]}).execute()
@@ -200,6 +257,91 @@ def all_bookings():
         "Type": "Walk-in" if r["is_walk_in"] else "Booked online",
         "Status": r["status"].replace("_", " ").capitalize(),
     } for r in rows]), hide_index=True, use_container_width=True)
+
+
+def fetch_all(build_query, page_size=1000):
+    """Supabase sends at most 1,000 rows at a time, so ask page by page until everything has arrived."""
+    rows, start = [], 0
+    while True:
+        chunk = build_query().range(start, start + page_size - 1).execute().data
+        rows += chunk
+        if len(chunk) < page_size:
+            return rows
+        start += page_size
+
+
+def customer_data():
+    """R11, R18: the owner downloads the shop's data as CSV and erases a customer's record on request."""
+    st.header("Customer data")
+    export_tab, erase_tab = st.tabs(["Download data (CSV)", "Erase a customer"])
+
+    with export_tab:
+        today = datetime.now(LONDON).date()
+        c1, c2 = st.columns(2)
+        start = c1.date_input("From", value=today - timedelta(days=30), format="DD/MM/YYYY", key="export_from")
+        end = c2.date_input("To", value=today, format="DD/MM/YYYY", key="export_to")
+        include_test = st.checkbox("Include test (replay) data", value=True)
+        if end < start:
+            st.error("The 'To' date must be on or after the 'From' date.")
+            return
+        frm = datetime.combine(start, time(0), LONDON)
+        to = datetime.combine(end + timedelta(days=1), time(0), LONDON)
+
+        def bookings_query():
+            q = db.table("bookings").select(
+                "id, start_time, end_time, status, is_walk_in, walk_in_name, is_test, "
+                "services(name, price), barbers(name), profiles(full_name)") \
+                .gte("start_time", frm.isoformat()).lt("start_time", to.isoformat()).order("start_time")
+            return q if include_test else q.eq("is_test", False)
+
+        rows = fetch_all(bookings_query)
+        bookings = pd.DataFrame([{
+            "Booking ID": r["id"],
+            "Date": datetime.fromisoformat(r["start_time"]).astimezone(LONDON).strftime("%d/%m/%Y"),
+            "Start": datetime.fromisoformat(r["start_time"]).astimezone(LONDON).strftime("%H:%M"),
+            "End": datetime.fromisoformat(r["end_time"]).astimezone(LONDON).strftime("%H:%M"),
+            "Customer": r["walk_in_name"] if r["is_walk_in"] else (r["profiles"] or {}).get("full_name"),
+            "Type": "Walk-in" if r["is_walk_in"] else "Booked online",
+            "Service": (r["services"] or {}).get("name"),
+            "Price (£)": float((r["services"] or {}).get("price") or 0),
+            "Barber": (r["barbers"] or {}).get("name", "Any"),
+            "Status": r["status"].replace("_", " ").capitalize(),
+            "Test data": "Yes" if r["is_test"] else "No",
+        } for r in rows])
+        st.write(f"**{len(bookings)} bookings** from {start.strftime('%d/%m/%Y')} to {end.strftime('%d/%m/%Y')}.")
+        if not bookings.empty:
+            st.dataframe(bookings.head(20), hide_index=True, use_container_width=True)
+            st.caption("Showing the first 20 rows. The download has them all.")
+            st.download_button("Download bookings (CSV)", bookings.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"fadecast-bookings-{start}-to-{end}.csv", mime="text/csv")
+
+        customers = pd.DataFrame(db.rpc("customer_list", {}).execute().data)
+        if not customers.empty:
+            st.download_button("Download customer list (CSV)", customers.rename(columns={
+                "full_name": "Name", "email": "Email", "joined": "Joined", "bookings": "Bookings",
+                "last_booking": "Last booking"}).drop(columns="id").to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"fadecast-customers-{today}.csv", mime="text/csv")
+
+    with erase_tab:
+        st.caption("Use this when a customer asks for their data to be deleted (UK GDPR right to erasure). "
+                   "Their login, email address and name are deleted, and any future bookings are cancelled. "
+                   "Their past visits stay only as anonymous counts, so the dashboard and forecast still work. "
+                   "This cannot be undone.")
+        customers = db.rpc("customer_list", {}).execute().data
+        if not customers:
+            st.info("There are no customer accounts yet.")
+            return
+        choice = st.selectbox("Customer", customers, format_func=lambda c:
+                              f"{c['full_name'] or 'No name'} · {c['email']} · {c['bookings']} booking(s)")
+        sure = st.checkbox(f"I understand that this permanently erases {choice['email']}")
+        if st.button("Erase this customer", type="primary", disabled=not sure):
+            try:
+                kept = db.rpc("erase_customer", {"p_customer": choice["id"]}).execute().data
+                st.session_state.flash = (f"Erased {choice['email']}. {kept} past booking(s) kept "
+                                          "as anonymous counts.")
+                st.rerun()
+            except Exception as e:
+                st.error(getattr(e, "message", None) or str(e))
 
 
 def clean(value):
@@ -350,6 +492,8 @@ def owner_settings():
 
 
 db = get_db()
+if "user" not in st.session_state:
+    finish_google_login()
 user = st.session_state.get("user")
 profile = st.session_state.get("profile")
 
@@ -360,7 +504,7 @@ with st.sidebar:
         st.caption(f"Role: {profile['role']}")
         if profile["role"] == "owner":
             page = st.radio("Go to", ["Today", "Dashboard and forecast", "Bookings", "Shop settings",
-                                      "Make a test booking"])
+                                      "Customer data", "Make a test booking"])
         elif profile["role"] == "barber":
             page = st.radio("Go to", ["Today", "Bookings"])
         if st.button("Log out"):
@@ -372,6 +516,10 @@ with st.sidebar:
                 st.session_state.pop(key, None)
             st.rerun()
     else:
+        # One-click Google sign-in, switched on with GOOGLE_SIGN_IN = true in the secrets
+        if st.secrets.get("GOOGLE_SIGN_IN", False):
+            st.link_button("Continue with Google", google_login_url(), use_container_width=True)
+            st.caption("Or use your email:")
         login_tab, signup_tab = st.tabs(["Log in", "Sign up"])
 
         with login_tab:
@@ -432,6 +580,8 @@ if role in ("owner", "barber"):
         all_bookings()
     elif page == "Shop settings":
         owner_settings()
+    elif page == "Customer data":
+        customer_data()
     else:
         booking_page()
         my_bookings()

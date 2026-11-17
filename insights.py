@@ -13,7 +13,7 @@ from logic import mape, mase, open_days, seasonal_naive
 
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 TEST_WEEKS = 4      # the last 4 weeks are held back to test the forecast
-FUTURE_DAYS = 14    # how far ahead to forecast
+FUTURE_DAYS = 28    # how far ahead to forecast: 4 weeks (R10)
 
 
 @st.cache_data(ttl=600, show_spinner="Running the forecast…")
@@ -48,6 +48,71 @@ def run_forecast(values, season, horizon_test, horizon_future):
     }
 
 
+def fetch_all(build_query, page_size=1000):
+    """Supabase sends at most 1,000 rows at a time, so ask page by page until everything has arrived."""
+    rows, start = [], 0
+    while True:
+        chunk = build_query().range(start, start + page_size - 1).execute().data
+        rows += chunk
+        if len(chunk) < page_size:
+            return rows
+        start += page_size
+
+
+def revenue_tab(db, tz, today):
+    """R07: revenue per barber and customers per service for a chosen date range, with drill-down by day."""
+    c1, c2 = st.columns(2)
+    start = c1.date_input("From", value=today - timedelta(days=30), format="DD/MM/YYYY", key="rev_from")
+    end = c2.date_input("To", value=today, format="DD/MM/YYYY", key="rev_to")
+    if end < start:
+        st.error("The 'To' date must be on or after the 'From' date.")
+        return
+    frm = datetime.combine(start, datetime.min.time(), tz)
+    to = datetime.combine(end + timedelta(days=1), datetime.min.time(), tz)
+    rows = fetch_all(lambda: db.table("bookings").select("start_time, services(name, price), barbers(name)")
+                     .eq("status", "finished").gte("start_time", frm.isoformat())
+                     .lt("start_time", to.isoformat()).order("start_time"))
+    if not rows:
+        st.caption("No finished appointments in these dates.")
+        return
+    df = pd.DataFrame([{
+        "day": datetime.fromisoformat(r["start_time"]).astimezone(tz).date(),
+        "Barber": (r["barbers"] or {}).get("name", "Any"),
+        "Service": (r["services"] or {}).get("name"),
+        "Revenue": float((r["services"] or {}).get("price") or 0),
+    } for r in rows])
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Revenue", f"£{df['Revenue'].sum():,.0f}")
+    k2.metric("Customers served", len(df))
+    k3.metric("Average per customer", f"£{df['Revenue'].mean():,.2f}")
+
+    left, right = st.columns(2)
+    per_barber = df.groupby("Barber", as_index=False).agg(Revenue=("Revenue", "sum"), Customers=("Revenue", "size"))
+    fig = px.bar(per_barber, x="Barber", y="Revenue", text_auto=".0f", labels={"Revenue": "Revenue (£)"},
+                 title="Revenue per barber")
+    fig.update_layout(height=320, margin=dict(t=40, b=10))
+    left.plotly_chart(fig, use_container_width=True)
+    per_service = df.groupby("Service", as_index=False).agg(Customers=("Revenue", "size"), Revenue=("Revenue", "sum"))
+    fig = px.bar(per_service, x="Service", y="Customers", text_auto=True, title="Customers per service")
+    fig.update_layout(height=320, margin=dict(t=40, b=10))
+    right.plotly_chart(fig, use_container_width=True)
+
+    st.write("**Revenue by day**")
+    by_day = df.groupby(["day", "Barber"], as_index=False)["Revenue"].sum()
+    fig = px.bar(by_day, x="day", y="Revenue", color="Barber", labels={"day": "", "Revenue": "Revenue (£)"})
+    fig.update_layout(height=320, margin=dict(t=10, b=10), legend_title_text="")
+    st.plotly_chart(fig, use_container_width=True)
+
+    days = sorted(df["day"].unique(), reverse=True)
+    pick = st.selectbox("Look at one day", days, format_func=lambda d: d.strftime("%a %d %b %Y"))
+    one = df[df["day"] == pick].groupby(["Barber", "Service"], as_index=False) \
+        .agg(Customers=("Revenue", "size"), Revenue=("Revenue", "sum"))
+    one["Revenue"] = one["Revenue"].map(lambda v: f"£{v:,.2f}")
+    st.dataframe(one, hide_index=True, use_container_width=True)
+    st.caption("Revenue uses each service's current price, for appointments marked finished.")
+
+
 def dashboard(db, tz):
     st.header("Dashboard and forecast")
     daily = pd.DataFrame(db.rpc("daily_stats", {"p_days": 180}).execute().data)
@@ -74,8 +139,12 @@ def dashboard(db, tz):
     else:
         c4.metric("Wait estimate error", "–")
 
-    tab_trend, tab_hours, tab_waits, tab_forecast = st.tabs(
-        ["Customers per day", "Busiest times", "Wait estimates", "Forecast"])
+    tab_trend, tab_revenue, tab_hours, tab_waits, tab_forecast = st.tabs(
+        ["Customers per day", "Revenue and services", "Busiest times", "Wait estimates", "Forecast"])
+
+    # ---------- Revenue per barber and bookings per service, for any date range (R07)
+    with tab_revenue:
+        revenue_tab(db, tz, today)
 
     # ---------- Customers per day
     with tab_trend:
@@ -119,7 +188,7 @@ def dashboard(db, tz):
                        f"{err.abs().mean():.1f} min; {(err.abs() <= 10).mean() * 100:.0f}% were within 10 minutes. "
                        "Dots on the dashed line were spot on.")
 
-    # ---------- Forecast (RQ1)
+    # ---------- Forecast (RQ3)
     with tab_forecast:
         hours = db.table("opening_hours").select("day_of_week, closed").execute().data
         closed = {h["day_of_week"] for h in hours if h["closed"]}
@@ -134,7 +203,7 @@ def dashboard(db, tz):
         future_days = open_days(today, today + timedelta(days=FUTURE_DAYS - 1), closed)
         result = run_forecast(tuple(counts.tolist()), season, horizon_test, len(future_days))
 
-        st.write("**How many customers to expect in the next two weeks**")
+        st.write("**How many customers to expect in the next four weeks**")
         future = pd.DataFrame({"day": future_days, "forecast": result["future"]})
         fig = go.Figure()
         recent = counts.iloc[-8 * season:]
