@@ -429,8 +429,8 @@ def owner_settings():
         edited = st.data_editor(original, key="barbers_editor", hide_index=True, use_container_width=True,
                                 disabled=["id"], column_config={
                                     "id": None,
-                                    "name": st.column_config.TextColumn("Barber", required=True),
-                                    "active": st.column_config.CheckboxColumn("Working here"),
+                                    "name": st.column_config.TextColumn("Barber", required=True, width="medium"),
+                                    "active": st.column_config.CheckboxColumn("Working here", width="medium"),
                                 })
         if st.button("Save barbers"):
             save_changes("barbers", original, edited, ["name", "active"], "id", "barbers_editor")
@@ -475,10 +475,10 @@ def owner_settings():
         edited = st.data_editor(original, key="hours_editor", hide_index=True, use_container_width=True,
                                 disabled=["day_of_week", "day"], column_config={
                                     "day_of_week": None,
-                                    "day": st.column_config.TextColumn("Day"),
-                                    "opens": st.column_config.TimeColumn("Opens", format="HH:mm", step=900),
-                                    "closes": st.column_config.TimeColumn("Closes", format="HH:mm", step=900),
-                                    "closed": st.column_config.CheckboxColumn("Closed"),
+                                    "day": st.column_config.TextColumn("Day", width="medium"),
+                                    "opens": st.column_config.TimeColumn("Opens", format="HH:mm", step=900, width="medium"),
+                                    "closes": st.column_config.TimeColumn("Closes", format="HH:mm", step=900, width="medium"),
+                                    "closed": st.column_config.CheckboxColumn("Closed", width="small"),
                                 })
         if st.button("Save opening hours"):
             problems = [r["day"] for _, r in edited.iterrows()
