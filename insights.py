@@ -227,7 +227,8 @@ def dashboard(db, tz):
 
         future["Day"] = [d.strftime("%a %d %b") for d in future["day"]]
         future["Expected customers"] = future["forecast"].round().astype(int)
-        future["Suggested barbers"] = np.clip(np.ceil(future["forecast"] / 7), 1, None).astype(int)
+        # Based on the rounded number shown, so the two columns always agree
+        future["Suggested barbers"] = np.clip(np.ceil(future["Expected customers"] / 7), 1, None).astype(int)
         st.dataframe(future[["Day", "Expected customers", "Suggested barbers"]], hide_index=True,
                      use_container_width=True)
         st.caption("Suggested barbers assumes each barber can see about 7 customers a day.")
